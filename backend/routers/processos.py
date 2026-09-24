@@ -1,0 +1,1137 @@
+"""
+Router de Processos de Admissão — versão otimizada.
+"""
+from flask import Blueprint, request, jsonify, send_file
+from database import get_db
+from security import require_auth
+from datetime import datetime, timezone
+from sqlalchemy import func, case
+from sqlalchemy.orm import joinedload, selectinload
+import models
+import audit
+import os
+import cache as _cache
+
+bp = Blueprint("processos", __name__, url_prefix="/api/processos")
+
+UPLOAD_FOLDER = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "uploads", "admissao"))
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+ETAPAS_FLUXO = [
+    {"ordem": 1,  "codigo": "TRIAGEM",              "nome": "Triagem",                        "departamento": "RH",         "tipo": "APROVACAO",   "prazo_dias": 2},
+    {"ordem": 2,  "codigo": "ENTREVISTA",            "nome": "Entrevista",                     "departamento": "RH",         "tipo": "ENTREVISTA",  "prazo_dias": 5},
+    {"ordem": 3,  "codigo": "CERTIFICADOS_NR",       "nome": "Verificação Certificados NRs",   "departamento": "RH",         "tipo": "DOCUMENTO",   "prazo_dias": 2},
+    {"ordem": 4,  "codigo": "APROVACAO_FINAL",       "nome": "Aprovação Final",                "departamento": "RH",         "tipo": "APROVACAO",   "prazo_dias": 1},
+    {"ordem": 5,  "codigo": "ASO",                   "nome": "Agendamento ASO",                "departamento": "DP",         "tipo": "DOCUMENTO",   "prazo_dias": 1},
+    {"ordem": 6,  "codigo": "DP_EXTERNO",            "nome": "Admissão DP Externo",            "departamento": "DP_EXTERNO", "tipo": "DOCUMENTO",   "prazo_dias": 2},
+    {"ordem": 7,  "codigo": "CADASTRO_GPM",          "nome": "Cadastro no GPM",                "departamento": "TI",         "tipo": "CHECKLIST",   "prazo_dias": 1},
+    {"ordem": 8,  "codigo": "ACESSO_TI",             "nome": "Criação de Email/Sistema",       "departamento": "TI",         "tipo": "CHECKLIST",   "prazo_dias": 1},
+    {"ordem": 9,  "codigo": "PRONTUARIO_SEGURANCA",  "nome": "Prontuário de Segurança",        "departamento": "SESMT",      "tipo": "DOCUMENTO",   "prazo_dias": 1},
+    {"ordem": 10, "codigo": "EPIS_UNIFORMES",        "nome": "Fornecimento EPIs e Uniformes",  "departamento": "SESMT",      "tipo": "DOCUMENTO",   "prazo_dias": 1},
+    {"ordem": 11, "codigo": "FORMACAO_NRS",          "nome": "Reciclagem NRs",                 "departamento": "SESMT",      "tipo": "DOCUMENTO",   "prazo_dias": 5},
+    {"ordem": 12, "codigo": "PROVA_DEEP",            "nome": "POP's de Segurança",             "departamento": "SESMT",      "tipo": "APROVACAO",   "prazo_dias": 3},
+    {"ordem": 13, "codigo": "ASSINATURAS",           "nome": "Coleta de Assinaturas",          "departamento": "DP",         "tipo": "DOCUMENTO",   "prazo_dias": 1},
+    {"ordem": 14, "codigo": "BEMHOEFT",              "nome": "Inclusão Prontuário Bemhoeft",   "departamento": "DP",         "tipo": "DOCUMENTO",   "prazo_dias": 3},
+    {"ordem": 15, "codigo": "GRAFICA_CRACHA",        "nome": "Confecção do Crachá",            "departamento": "DP",         "tipo": "CHECKLIST",   "prazo_dias": 1},
+    {"ordem": 16, "codigo": "INTEGRACAO_EQUATORIAL", "nome": "Integração Equatorial",          "departamento": "DP",         "tipo": "DOCUMENTO",   "prazo_dias": 1},
+    {"ordem": 17, "codigo": "LIBERADO_CAMPO",        "nome": "Liberação para Campo",           "departamento": "DP",         "tipo": "APROVACAO",   "prazo_dias": 1},
+]
+
+DEPT_LABEL = {
+    "RH": "Recursos Humanos",
+    "DP": "Departamento Pessoal",
+    "DP_EXTERNO": "DP Externo",
+    "SESMT": "SESMT",
+    "TI": "TI",
+}
+
+# Etapas que exigem validação de um SEGUNDO departamento antes de avançar de fato.
+# Fluxo: o departamento "dono" da etapa (ex: RH) anexa/confere e clica "Aprovar" →
+# em vez de avançar para a próxima etapa, ela é ENCAMINHADA para o departamento
+# validador (aqui: SESMT), que passa a enxergar a mesma etapa (com os mesmos
+# documentos) na fila dele. Só quando o validador aprova é que o processo avança
+# de verdade. Se o validador pedir reenvio, a etapa volta para o departamento de
+# origem. Para adicionar outra etapa com o mesmo comportamento, basta incluir o
+# código dela aqui.
+ETAPAS_VALIDACAO_DUPLA = {
+    "CERTIFICADOS_NR": "SESMT",
+}
+
+
+def doc_to_dict(d):
+    return {
+        "id":                d.id,
+        "nome":              d.nome,
+        "arquivo":           d.arquivo,
+        "sharepointUrl":     d.sharepoint_url,
+        "sharepointErro":    getattr(d, "sharepoint_erro", None),
+        "enviadoPor":        d.enviado_por,
+        "status":            d.status,
+        "observacao":        d.observacao,
+        "comentarioInterno": getattr(d, "comentario_interno", None) or "",
+        "versao":            getattr(d, "versao", 1) or 1,
+        "createdAt":         d.created_at.isoformat() if d.created_at else None,
+    }
+
+
+def etapa_to_dict(e):
+    validador = ETAPAS_VALIDACAO_DUPLA.get(e.codigo)
+    # Ainda não chegou no validador final (ex: está com RH, falta ir pro SESMT)
+    handoff_para = validador if (validador and e.departamento != validador) else None
+    # Já está com o validador final, aguardando a decisão dele
+    em_validacao_final = bool(validador and e.departamento == validador and e.status == "EM_ANDAMENTO")
+    return {
+        "id":           e.id,
+        "ordem":        e.ordem,
+        "codigo":       e.codigo,
+        "nome":         e.nome,
+        "departamento": e.departamento,
+        "deptLabel":    DEPT_LABEL.get(e.departamento, e.departamento),
+        "tipo":         e.tipo,
+        "status":       e.status,
+        "prazo_dias":   e.prazo_dias,
+        "observacao":   e.observacao,
+        "nota":         e.nota,
+        "notaExterna":  getattr(e, "nota_externa", None) or "",
+        "responsavel":  e.responsavel,
+        "handoffPara":       handoff_para,
+        "handoffParaLabel":  DEPT_LABEL.get(handoff_para) if handoff_para else None,
+        "emValidacaoFinal":  em_validacao_final,
+        "iniciadoEm":   e.iniciado_em.isoformat() if e.iniciado_em else None,
+        "concluidoEm":  e.concluido_em.isoformat() if e.concluido_em else None,
+        "documentos":   [doc_to_dict(d) for d in e.documentos],
+    }
+
+
+def _calc_progresso(etapas):
+    if not etapas:
+        return 0
+    total     = len(etapas)
+    concluidas = sum(1 for e in etapas if e.status in ("APROVADO", "NAO_APLICAVEL"))
+    return round(concluidas / total * 100)
+
+
+def processo_to_dict_list(p):
+    """Versão leve para listagem — sem documentos, só dados essenciais."""
+    c = p.candidatura
+    etapas = p.etapas  # já carregadas com selectinload
+    etapa_atual = next((e for e in etapas if e.status == "EM_ANDAMENTO"),
+                  next((e for e in sorted(etapas, key=lambda x: x.ordem) if e.status == "PENDENTE"), None))
+    return {
+        "id":            p.id,
+        "status":        p.status,
+        "etapaAtual":    p.etapa_atual,
+        "sharepointUrl": p.sharepoint_url,
+        "progresso":     _calc_progresso(etapas),
+        "candidatura": {
+            "id":    c.id,
+            "nome":  c.full_name,
+            "cpf":   c.cpf,
+            "cargo": c.job.position if c.job else "—",
+            "local": c.job.location if c.job else "—",
+        },
+        "etapas": [{
+            "id":           e.id,
+            "nome":         e.nome,
+            "departamento": e.departamento,
+            "status":       e.status,
+            "prazo_data":   None,
+        } for e in etapas],
+    }
+
+
+def processo_to_dict(p):
+    """Versão completa para detalhe — inclui documentos."""
+    c = p.candidatura
+    return {
+        "id":            p.id,
+        "status":        p.status,
+        "etapaAtual":    p.etapa_atual,
+        "sharepointUrl": p.sharepoint_url,
+        "createdAt":     p.created_at.isoformat() if p.created_at else None,
+        "updatedAt":     p.updated_at.isoformat() if p.updated_at else None,
+        "candidatura": {
+            "id":    c.id,
+            "nome":  c.full_name,
+            "cpf":   c.cpf,
+            "email": c.email,
+            "phone": c.phone,
+            "cargo": c.job.position if c.job else "—",
+            "local": c.job.location if c.job else "—",
+        },
+        "etapas":          [etapa_to_dict(e) for e in p.etapas],
+        "progresso":       _calc_progresso(p.etapas),
+        "notasInternas":   getattr(p, "notas_internas", None) or "",
+        "salarioProposto": float(getattr(p, "salario_proposto", None)) if getattr(p, "salario_proposto", None) else None,
+        "salarioObs":      getattr(p, "salario_observacao", None) or "",
+    }
+
+
+def _criar_etapas(processo_id, db):
+    for e in ETAPAS_FLUXO:
+        db.add(models.EtapaProcesso(
+            processo_id=processo_id,
+            ordem=e["ordem"], codigo=e["codigo"], nome=e["nome"],
+            departamento=e["departamento"], tipo=e["tipo"],
+            prazo_dias=e["prazo_dias"], status="PENDENTE",
+        ))
+
+
+def _avancar_etapa(processo, db):
+    pendentes = sorted([e for e in processo.etapas if e.status == "PENDENTE"], key=lambda x: x.ordem)
+    if pendentes:
+        prox = pendentes[0]
+        prox.status      = "EM_ANDAMENTO"
+        prox.iniciado_em = datetime.now(timezone.utc)
+        processo.etapa_atual = prox.nome
+    else:
+        processo.status      = "CONCLUIDO"
+        processo.etapa_atual = "Concluído"
+        if not processo.concluido_em:
+            processo.concluido_em = datetime.now(timezone.utc)
+    db.commit()
+
+
+def criar_processo_para_candidatura(candidatura_id: int, db,
+                                     tipo_admissao: str = "ADMISSAO_NOVA") -> models.ProcessoAdmissao:
+    existing = db.query(models.ProcessoAdmissao).filter_by(candidatura_id=candidatura_id).first()
+    if existing:
+        return existing
+
+    processo = models.ProcessoAdmissao(
+        candidatura_id=candidatura_id,
+        status="EM_ANDAMENTO",
+        etapa_atual="Aprovação Final",
+        tipo_admissao=tipo_admissao,
+    )
+    db.add(processo)
+    db.flush()
+    _criar_etapas(processo.id, db)
+    db.flush()
+
+    # Triagem e Entrevista já aprovadas (candidato passou pelo funil de seleção)
+    db.query(models.EtapaProcesso).filter(
+        models.EtapaProcesso.processo_id == processo.id,
+        models.EtapaProcesso.codigo.in_(["TRIAGEM", "ENTREVISTA"])
+    ).update({"status": "APROVADO", "concluido_em": datetime.now(timezone.utc)},
+              synchronize_session=False)
+
+    # Inicia na Aprovação Final
+    aprovacao = db.query(models.EtapaProcesso).filter_by(
+        processo_id=processo.id, codigo="APROVACAO_FINAL"
+    ).first()
+    if aprovacao:
+        aprovacao.status      = "EM_ANDAMENTO"
+        aprovacao.iniciado_em = datetime.now(timezone.utc)
+
+    db.commit()
+
+    try:
+        cand = db.query(models.Candidatura).filter_by(id=candidatura_id).first()
+        if cand:
+            from sharepoint_service import criar_pasta_colaborador
+            cand_cargo = cand.job.position if cand.job else None
+            result = criar_pasta_colaborador(cand.full_name, cand.cpf, cand_cargo)
+            if result.get("url"):
+                processo.sharepoint_url = result["url"]
+                db.commit()
+    except Exception as e:
+        print(f"[SHAREPOINT] Erro ao confirmar pasta: {e}")
+
+    return processo
+
+
+# ── Listar processos — otimizado ──────────────────────────────
+
+@bp.get("")
+@require_auth
+def listar():
+    status_f = request.args.get("status", "").upper()
+    dept_f   = request.args.get("departamento", "").upper()
+    local_f  = request.args.get("local", "").strip()
+    nome_f   = request.args.get("nome", "").strip()
+    cargo_f  = request.args.get("cargo", "").strip()
+    page     = max(1, int(request.args.get("page", 1)))
+    per_page = 30  # aumentado de 20 para 30
+
+    cache_key = f"lista:{status_f}:{dept_f}:{local_f}:{nome_f}:{cargo_f}:{page}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return jsonify(hit)
+
+    db = get_db()
+    try:
+        q = db.query(models.ProcessoAdmissao)
+
+        if status_f:
+            q = q.filter(models.ProcessoAdmissao.status == status_f)
+        else:
+            # Por padrão, não mostra cancelados na lista principal
+            q = q.filter(models.ProcessoAdmissao.status != "CANCELADO")
+
+        # Filtro por dept via JOIN no banco (não Python-side)
+        if dept_f:
+            q = q.join(
+                models.EtapaProcesso,
+                (models.EtapaProcesso.processo_id == models.ProcessoAdmissao.id) &
+                (models.EtapaProcesso.status == "EM_ANDAMENTO") &
+                (models.EtapaProcesso.departamento == dept_f)
+            )
+
+        # Filtro por regional (local da vaga), função (cargo) e/ou nome do candidato
+        if local_f or nome_f or cargo_f:
+            q = q.join(
+                models.Candidatura,
+                models.Candidatura.id == models.ProcessoAdmissao.candidatura_id
+            )
+            if local_f or cargo_f:
+                q = q.join(
+                    models.Job, models.Job.id == models.Candidatura.job_id
+                )
+                if local_f:
+                    q = q.filter(models.Job.location == local_f)
+                if cargo_f:
+                    q = q.filter(models.Job.position.ilike(f"%{cargo_f}%"))
+            if nome_f:
+                q = q.filter(models.Candidatura.full_name.ilike(f"%{nome_f}%"))
+
+        if dept_f and (local_f or nome_f or cargo_f):
+            q = q.distinct()
+
+        total = q.count()
+
+        # Eager load: etapas sem documentos (para listagem)
+        rows = (
+            q.options(
+                joinedload(models.ProcessoAdmissao.candidatura)
+                    .joinedload(models.Candidatura.job),
+                selectinload(models.ProcessoAdmissao.etapas),  # sem docs
+            )
+            .order_by(models.ProcessoAdmissao.updated_at.desc())
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+            .all()
+        )
+
+        result = {
+            "items":      [processo_to_dict_list(p) for p in rows],
+            "total":      total,
+            "page":       page,
+            "totalPages": max(1, -(-total // per_page)),
+        }
+        _cache.set(cache_key, result, ttl=12)
+        return jsonify(result)
+    finally:
+        db.close()
+
+
+@bp.get("/stats")
+@require_auth
+def stats():
+    hit = _cache.get("stats")
+    if hit is not None:
+        return jsonify(hit)
+    db = get_db()
+    try:
+        # 1 query com CASE ao invés de 4 separadas
+        row = db.execute(
+            __import__('sqlalchemy').text("""
+                SELECT
+                    COUNT(*)                                                AS total,
+                    COUNT(*) FILTER (WHERE status = 'EM_ANDAMENTO')        AS andamento,
+                    COUNT(*) FILTER (WHERE status = 'CONCLUIDO')           AS concluidos,
+                    COUNT(*) FILTER (WHERE status = 'CANCELADO')           AS cancelados
+                FROM processo_admissao
+            """)
+        ).fetchone()
+
+        # Etapas ativas por dept — 1 query
+        dept_rows = db.execute(
+            __import__('sqlalchemy').text("""
+                SELECT departamento, COUNT(*) AS total
+                FROM etapa_processo
+                WHERE status = 'EM_ANDAMENTO'
+                GROUP BY departamento
+            """)
+        ).fetchall()
+
+        return jsonify({
+            "total":     row[0] or 0,
+            "andamento": row[1] or 0,
+            "concluidos":row[2] or 0,
+            "cancelados":row[3] or 0,
+            "porDept":   {r[0]: r[1] for r in dept_rows},
+        })
+    finally:
+        db.close()
+
+
+@bp.get("/<int:processo_id>")
+@require_auth
+def detalhe(processo_id):
+    hit = _cache.get(f"proc:{processo_id}")
+    if hit is not None:
+        return jsonify(hit)
+    db = get_db()
+    try:
+        # Eager load completo: etapas + documentos em 1 query
+        p = (
+            db.query(models.ProcessoAdmissao)
+            .options(
+                joinedload(models.ProcessoAdmissao.candidatura)
+                    .joinedload(models.Candidatura.job),
+                selectinload(models.ProcessoAdmissao.etapas)
+                    .selectinload(models.EtapaProcesso.documentos),
+            )
+            .filter_by(id=processo_id)
+            .first()
+        )
+        if not p:
+            return jsonify({"message": "Processo não encontrado"}), 404
+        result = processo_to_dict(p)
+        _cache.set(f"proc:{processo_id}", result, ttl=20)
+        return jsonify(result)
+    finally:
+        db.close()
+
+
+# ── Atualizar etapa ───────────────────────────────────────────
+
+@bp.patch("/<int:processo_id>/etapas/<int:etapa_id>")
+@require_auth
+def atualizar_etapa(processo_id, etapa_id):
+    data = request.get_json()
+    db   = get_db()
+    try:
+        p = (
+            db.query(models.ProcessoAdmissao)
+            .options(
+                joinedload(models.ProcessoAdmissao.candidatura)
+                    .joinedload(models.Candidatura.job),
+                selectinload(models.ProcessoAdmissao.etapas)
+                    .selectinload(models.EtapaProcesso.documentos),
+            )
+            .filter_by(id=processo_id)
+            .first()
+        )
+        if not p:
+            return jsonify({"message": "Processo não encontrado"}), 404
+
+        e = next((x for x in p.etapas if x.id == etapa_id), None)
+        if not e:
+            return jsonify({"message": "Etapa não encontrada"}), 404
+
+        novo_status = data.get("status", "").upper()
+        if novo_status not in ("APROVADO", "REPROVADO", "REENVIAR", "EM_ANDAMENTO", "NAO_APLICAVEL"):
+            return jsonify({"message": "Status inválido"}), 400
+
+        old_status = e.status
+        etapa_nome = e.nome
+        old_departamento = e.departamento
+
+        cand       = p.candidatura
+        cand_email = cand.email
+        cand_nome  = cand.full_name
+        cand_cpf   = cand.cpf
+        cand_cargo = cand.job.position if cand.job else "—"
+        sp_url     = p.sharepoint_url
+
+        # ── Validação dupla (ex: RH confere, SESMT valida) ────────────────
+        validador_final = ETAPAS_VALIDACAO_DUPLA.get(e.codigo)
+        # Departamento de origem "dono" da etapa é sempre o do fluxo padrão
+        origem_padrao = next(
+            (x["departamento"] for x in ETAPAS_FLUXO if x["codigo"] == e.codigo),
+            old_departamento
+        )
+        # RH (origem) está aprovando, mas ainda falta passar pelo validador
+        is_handoff_para_validador = (
+            novo_status == "APROVADO" and validador_final
+            and old_departamento != validador_final
+        )
+        # Validador (SESMT) pediu reenvio — devolve para o departamento de origem
+        is_devolucao_do_validador = (
+            novo_status == "REENVIAR" and validador_final
+            and old_departamento == validador_final
+        )
+
+        e.status       = novo_status
+        e.nota         = data.get("nota", e.nota)
+        e.nota_externa = data.get("notaExterna", getattr(e, "nota_externa", None))
+        e.observacao   = data.get("observacao", e.observacao)
+        e.responsavel  = request.username
+        e.concluido_em = datetime.now(timezone.utc) if novo_status in ("APROVADO", "REPROVADO", "NAO_APLICAVEL") else None
+        nota_externa   = getattr(e, "nota_externa", None) or ""
+        nota_texto     = e.nota
+
+        detail_extra = ""
+        if novo_status == "REPROVADO":
+            p.status      = "CANCELADO"
+            p.etapa_atual = f"Reprovado em: {etapa_nome}"
+            db.commit()
+        elif is_handoff_para_validador:
+            # Não avança de etapa ainda — só troca o "dono" para o validador
+            e.status       = "EM_ANDAMENTO"
+            e.departamento = validador_final
+            e.concluido_em = None
+            detail_extra   = f" — encaminhado para {DEPT_LABEL.get(validador_final, validador_final)} validar"
+            db.commit()
+        elif is_devolucao_do_validador:
+            e.status       = "EM_ANDAMENTO"
+            e.departamento = origem_padrao
+            e.concluido_em = None
+            detail_extra   = f" — devolvido para {DEPT_LABEL.get(origem_padrao, origem_padrao)} corrigir"
+            db.commit()
+        elif novo_status in ("APROVADO", "NAO_APLICAVEL"):
+            _avancar_etapa(p, db)
+        else:
+            db.commit()
+
+        audit.log(request.username, "ETAPA_ATUALIZADA", entity="processo",
+                  entity_id=processo_id,
+                  detail=f"{etapa_nome}: {old_status} → {novo_status}{detail_extra}")
+
+        # Invalida cache para dados frescos na próxima leitura
+        _cache.invalidate_processo(processo_id)
+
+        # ── Notificação ao candidato ──────────────────────────────────────────
+        # (não notifica o candidato no handoff RH→SESMT: para ele, a etapa
+        # ainda não terminou de fato — só quando o validador final aprovar)
+        if novo_status in ("APROVADO", "REPROVADO", "REENVIAR") and not is_handoff_para_validador:
+            try:
+                from email_service import notify_etapa_candidato
+                class _Cand:
+                    pass
+                c = _Cand(); c.full_name = cand_nome; c.email = cand_email
+                class _Job:
+                    pass
+                j = _Job(); j.position = cand_cargo; c.job = j
+                notify_etapa_candidato(c, etapa_nome, novo_status, nota_texto)
+            except Exception as ex:
+                print(f"[EMAIL] Erro (candidato): {ex}")
+
+        # ── Notificação para departamentos internos (RH, DP, SESMT, TI) ──────
+        try:
+            from email_service import (
+                notify_depts_etapa_atualizada,
+                notify_depts_admissao_concluida,
+            )
+            # Reconstói objeto leve para o email_service
+            class _CandDept:
+                pass
+            class _JobDept:
+                pass
+            cd = _CandDept()
+            cd.full_name = cand_nome
+            cd.email     = cand_email
+            jd           = _JobDept()
+            jd.position  = cand_cargo
+            cd.job       = jd
+
+            # Notifica depts sobre a mudança de etapa
+            # (no handoff RH→SESMT, o e-mail interno reflete "em andamento",
+            # não "aprovado" — a etapa ainda não terminou de fato)
+            status_novo_email = "EM_ANDAMENTO" if is_handoff_para_validador else novo_status
+            notify_depts_etapa_atualizada(
+                candidatura   = cd,
+                etapa_nome    = etapa_nome,
+                departamento  = e.departamento,
+                status_anterior = old_status,
+                status_novo   = status_novo_email,
+                responsavel   = request.username,
+                processo_id   = processo_id,
+            )
+
+            # Se o processo foi concluído (última etapa aprovada), notifica todos
+            if p.status == "CONCLUIDO":
+                notify_depts_admissao_concluida(cd, processo_id, request.username)
+
+        except Exception as ex:
+            print(f"[EMAIL] Erro (departamentos): {ex}")
+
+        if not sp_url:
+            try:
+                from sharepoint_service import criar_pasta_colaborador
+                result = criar_pasta_colaborador(cand_nome, cand_cpf, cand_cargo)
+                if result.get("url"):
+                    db2 = get_db()
+                    try:
+                        proc = db2.query(models.ProcessoAdmissao).filter_by(id=processo_id).first()
+                        if proc:
+                            proc.sharepoint_url = result["url"]
+                            db2.commit()
+                    finally:
+                        db2.close()
+            except Exception as ex:
+                print(f"[SHAREPOINT] Erro: {ex}")
+
+        db.refresh(p)
+        return jsonify(processo_to_dict(p))
+    finally:
+        db.close()
+
+
+# ── Upload de documento ───────────────────────────────────────
+
+@bp.post("/<int:processo_id>/etapas/<int:etapa_id>/documentos")
+@require_auth
+def upload_doc(processo_id, etapa_id):
+    db = get_db()
+    try:
+        p = db.query(models.ProcessoAdmissao).filter_by(id=processo_id).first()
+        if not p:
+            return jsonify({"message": "Processo não encontrado"}), 404
+
+        e = db.query(models.EtapaProcesso).filter_by(id=etapa_id, processo_id=processo_id).first()
+        if not e:
+            return jsonify({"message": "Etapa não encontrada"}), 404
+
+        arquivo = request.files.get("arquivo")
+        if not arquivo or not arquivo.filename:
+            return jsonify({"message": "Arquivo obrigatório"}), 400
+
+        # 1. Salva localmente imediatamente
+        safe_name = arquivo.filename.replace(" ", "_")
+        dest = os.path.join(UPLOAD_FOLDER, f"{processo_id}_{etapa_id}_{safe_name}")
+        arquivo.save(dest)
+
+        # 2. Registra o documento no banco SEM esperar SharePoint
+        doc = models.DocumentoEtapa(
+            etapa_id=etapa_id, nome=arquivo.filename, arquivo=dest,
+            sharepoint_url=None,  # será atualizado em background
+            enviado_por=request.username, status="PENDENTE",
+        )
+        db.add(doc)
+        db.commit()
+        db.refresh(doc)
+        _cache.invalidate_processo(processo_id)
+        doc_id   = doc.id
+        cand     = p.candidatura
+        cand_nome = cand.full_name
+        cand_cpf  = cand.cpf
+        cand_cargo = cand.job.position if cand.job else None
+        etapa_nome   = e.nome
+        etapa_codigo = e.codigo
+        sp_url_atual = p.sharepoint_url
+
+        audit.log(request.username, "UPLOAD_DOC_ETAPA", entity="processo",
+                  entity_id=processo_id, detail=f"Doc '{arquivo.filename}' na etapa '{etapa_nome}'")
+
+        # 3. Upload SharePoint em background (não bloqueia a resposta)
+        import threading
+        def _upload_sp():
+            try:
+                from sharepoint_service import criar_pasta_colaborador, upload_documento, montar_nome_pasta
+                pasta = montar_nome_pasta(cand_nome, cand_cpf, cand_cargo)
+
+                sp_url = None
+                if not sp_url_atual:
+                    result = criar_pasta_colaborador(cand_nome, cand_cpf, cand_cargo)
+                    if result.get("url"):
+                        db2 = get_db()
+                        try:
+                            proc = db2.query(models.ProcessoAdmissao).filter_by(id=processo_id).first()
+                            if proc:
+                                proc.sharepoint_url = result["url"]
+                                db2.commit()
+                        finally:
+                            db2.close()
+
+                resultado = upload_documento(dest, safe_name, pasta, sub_pasta=etapa_nome, codigo_etapa=etapa_codigo)
+                sp_url = resultado.get("url")
+                sp_erro = resultado.get("erro")
+                db3 = get_db()
+                try:
+                    d = db3.query(models.DocumentoEtapa).filter_by(id=doc_id).first()
+                    if d:
+                        if sp_url:
+                            d.sharepoint_url = sp_url
+                            d.sharepoint_erro = None
+                            print(f"[SHAREPOINT] Upload concluído em background: {sp_url}")
+                        else:
+                            d.sharepoint_erro = sp_erro or "Falha desconhecida no upload"
+                            print(f"[SHAREPOINT] Upload falhou definitivamente: {sp_erro}")
+                        db3.commit()
+                finally:
+                    db3.close()
+            except Exception as ex:
+                print(f"[SHAREPOINT] Upload background falhou: {ex}")
+                try:
+                    db4 = get_db()
+                    try:
+                        d = db4.query(models.DocumentoEtapa).filter_by(id=doc_id).first()
+                        if d:
+                            d.sharepoint_erro = str(ex)
+                            db4.commit()
+                    finally:
+                        db4.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_upload_sp, daemon=True).start()
+
+        # 4. Retorna imediatamente sem esperar SharePoint
+        return jsonify(doc_to_dict(doc)), 201
+    finally:
+        db.close()
+
+
+# ── Reenvio manual ao SharePoint (quando o upload em background falhou) ──
+
+@bp.post("/<int:processo_id>/etapas/<int:etapa_id>/documentos/<int:doc_id>/reenviar-sharepoint")
+@require_auth
+def reenviar_sharepoint(processo_id, etapa_id, doc_id):
+    db = get_db()
+    try:
+        p = db.query(models.ProcessoAdmissao).filter_by(id=processo_id).first()
+        if not p:
+            return jsonify({"message": "Processo não encontrado"}), 404
+
+        e = db.query(models.EtapaProcesso).filter_by(id=etapa_id, processo_id=processo_id).first()
+        if not e:
+            return jsonify({"message": "Etapa não encontrada"}), 404
+
+        d = db.query(models.DocumentoEtapa).filter_by(id=doc_id, etapa_id=etapa_id).first()
+        if not d:
+            return jsonify({"message": "Documento não encontrado"}), 404
+
+        if not d.arquivo or not os.path.exists(d.arquivo):
+            return jsonify({"message": "Arquivo local não existe mais neste servidor. "
+                                        "Peça para substituir o documento reenviando o PDF novamente."}), 409
+
+        cand = p.candidatura
+        cand_nome = cand.full_name
+        cand_cpf  = cand.cpf
+        cand_cargo = cand.job.position if cand.job else None
+        etapa_nome   = e.nome
+        etapa_codigo = e.codigo
+        sp_url_atual = p.sharepoint_url
+        dest = d.arquivo
+        safe_name = os.path.basename(dest)
+        doc_id_local = d.id
+
+        audit.log(request.username, "REENVIO_MANUAL_SHAREPOINT", entity="processo",
+                  entity_id=processo_id, detail=f"Doc '{d.nome}' (id {doc_id}) reenviado manualmente ao SharePoint")
+
+        from sharepoint_service import criar_pasta_colaborador, upload_documento, montar_nome_pasta
+        pasta = montar_nome_pasta(cand_nome, cand_cpf, cand_cargo)
+
+        if not sp_url_atual:
+            result = criar_pasta_colaborador(cand_nome, cand_cpf, cand_cargo)
+            if result.get("url"):
+                p.sharepoint_url = result["url"]
+                db.commit()
+
+        resultado = upload_documento(dest, safe_name, pasta, sub_pasta=etapa_nome, codigo_etapa=etapa_codigo)
+        sp_url = resultado.get("url")
+        sp_erro = resultado.get("erro")
+
+        d2 = db.query(models.DocumentoEtapa).filter_by(id=doc_id_local).first()
+        if sp_url:
+            d2.sharepoint_url = sp_url
+            d2.sharepoint_erro = None
+            db.commit()
+            return jsonify({"ok": True, "sharepointUrl": sp_url}), 200
+        else:
+            d2.sharepoint_erro = sp_erro or "Falha desconhecida no upload"
+            db.commit()
+            return jsonify({"ok": False, "message": f"Reenvio falhou: {sp_erro}"}), 502
+    finally:
+        db.close()
+
+
+# ── Notas internas + Salário (não enviado ao candidato) ─────
+
+@bp.patch("/<int:processo_id>/interno")
+@require_auth
+def atualizar_interno(processo_id):
+    """Salva notas internas e salário proposto — nunca enviados ao candidato."""
+    data = request.get_json()
+    db   = get_db()
+    try:
+        p = db.query(models.ProcessoAdmissao).filter_by(id=processo_id).first()
+        if not p:
+            return jsonify({"message": "Processo não encontrado"}), 404
+
+        if "notasInternas" in data:
+            p.notas_internas = data["notasInternas"]
+        if "salarioProposto" in data:
+            try:
+                p.salario_proposto = float(data["salarioProposto"]) if data["salarioProposto"] else None
+            except (ValueError, TypeError):
+                pass
+        if "salarioObs" in data:
+            p.salario_observacao = data["salarioObs"]
+
+        db.commit()
+        audit.log(request.username, "NOTAS_INTERNAS", entity="processo",
+                  entity_id=processo_id, detail="Notas internas atualizadas")
+        return jsonify({"ok": True})
+    finally:
+        db.close()
+
+
+# ── Revisar documento ─────────────────────────────────────────
+
+@bp.patch("/<int:processo_id>/etapas/<int:etapa_id>/documentos/<int:doc_id>")
+@require_auth
+def revisar_doc(processo_id, etapa_id, doc_id):
+    data = request.get_json()
+    db   = get_db()
+    try:
+        doc = db.query(models.DocumentoEtapa).filter_by(id=doc_id, etapa_id=etapa_id).first()
+        if not doc:
+            return jsonify({"message": "Documento não encontrado"}), 404
+        novo = data.get("status", "").upper()
+        if novo not in ("APROVADO", "REPROVADO", "REENVIAR"):
+            return jsonify({"message": "Status inválido"}), 400
+        doc.status     = novo
+        doc.observacao = data.get("observacao", doc.observacao)
+        db.commit()
+        audit.log(request.username, "REVISAO_DOC", entity="processo",
+                  entity_id=processo_id, detail=f"Doc '{doc.nome}': {novo}")
+        return jsonify(doc_to_dict(doc))
+    finally:
+        db.close()
+
+
+# ── Comentário interno em documento (sem email) ──────────────
+
+@bp.patch("/<int:processo_id>/etapas/<int:etapa_id>/documentos/<int:doc_id>/comentar")
+@require_auth
+def comentar_doc(processo_id, etapa_id, doc_id):
+    """Salva comentário interno num documento — não envia email ao candidato."""
+    data = request.get_json()
+    db   = get_db()
+    try:
+        doc = db.query(models.DocumentoEtapa).filter_by(id=doc_id, etapa_id=etapa_id).first()
+        if not doc:
+            return jsonify({"message": "Documento não encontrado"}), 404
+        doc.comentario_interno = data.get("comentario", "")
+        db.commit()
+        audit.log(request.username, "COMENTARIO_DOC", entity="processo",
+                  entity_id=processo_id, detail=f"Comentário em '{doc.nome}'")
+        return jsonify(doc_to_dict(doc))
+    finally:
+        db.close()
+
+
+# ── Substituição de documento (sem email ao candidato) ────────
+
+@bp.post("/<int:processo_id>/etapas/<int:etapa_id>/documentos/<int:doc_id>/substituir")
+@require_auth
+def substituir_doc(processo_id, etapa_id, doc_id):
+    """Substitui um documento por nova versão. Não envia email ao candidato.
+    O arquivo antigo é removido do SharePoint e substituído pelo novo."""
+    arquivo  = request.files.get("arquivo")
+    motivo   = request.form.get("motivo", "Substituição de documento")
+    if not arquivo or not arquivo.filename:
+        return jsonify({"message": "Arquivo obrigatório"}), 400
+
+    db = get_db()
+    try:
+        doc_antigo = db.query(models.DocumentoEtapa).filter_by(id=doc_id, etapa_id=etapa_id).first()
+        if not doc_antigo:
+            return jsonify({"message": "Documento não encontrado"}), 404
+
+        etapa = db.query(models.EtapaProcesso).filter_by(id=etapa_id).first()
+        processo = db.query(models.ProcessoAdmissao).filter_by(id=processo_id).first()
+        candidatura = db.query(models.Candidatura).filter_by(id=processo.candidatura_id).first()
+
+        # Salva novo arquivo local
+        safe_name = arquivo.filename.replace(" ", "_")
+        UPLOAD_FOLDER = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "uploads"))
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        dest = os.path.join(UPLOAD_FOLDER, f"v{(getattr(doc_antigo,'versao',1) or 1)+1}_{etapa_id}_{safe_name}")
+        arquivo.save(dest)
+
+        # Cria novo registro de documento (nova versão)
+        doc_novo = models.DocumentoEtapa(
+            etapa_id      = etapa_id,
+            nome          = arquivo.filename,
+            arquivo       = dest,
+            enviado_por   = request.username,
+            status        = "PENDENTE",
+            observacao    = None,
+            comentario_interno = motivo,
+            versao        = (getattr(doc_antigo, "versao", 1) or 1) + 1,
+        )
+        db.add(doc_novo)
+        db.flush()
+
+        # Marca documento antigo como substituído
+        doc_antigo.substituido_por = doc_novo.id
+        doc_antigo.comentario_interno = f"Substituído: {motivo}"
+        db.commit()
+        db.refresh(doc_novo)
+
+        doc_novo_id = doc_novo.id
+
+        # Upload SharePoint em background — apaga antigo, sobe novo
+        import threading
+        sp_url_antigo = doc_antigo.sharepoint_url
+
+        def _substituir_sp():
+            try:
+                from sharepoint_service import upload_documento, _get_token, _get_site_id, _get_drive_id, BASE_PATH
+                import requests as req_lib
+
+                cpf_limpo = (candidatura.cpf or "").replace(".", "").replace("-", "")
+                pasta      = f"{candidatura.full_name} - {cpf_limpo}"
+                etapa_nome = etapa.nome if etapa else "Documentos"
+                codigo     = etapa.codigo if etapa else ""
+
+                # Upload do novo arquivo
+                resultado_sp = upload_documento(dest, safe_name, pasta,
+                                          sub_pasta=etapa_nome, codigo_etapa=codigo)
+                sp_url = resultado_sp.get("url")
+                sp_erro = resultado_sp.get("erro")
+
+                # Tenta apagar o arquivo antigo do SharePoint
+                if sp_url_antigo:
+                    try:
+                        token    = _get_token()
+                        site_id  = _get_site_id()
+                        drive_id = _get_drive_id(site_id)
+                        headers  = {"Authorization": f"Bearer {token}"}
+                        # Busca item pelo nome antigo para deletar
+                        nome_antigo = doc_antigo.nome.replace(" ", "_")
+                        caminho_antigo = f"{BASE_PATH}/{pasta}/{etapa_nome}/{nome_antigo}"
+                        url_item = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{caminho_antigo}"
+                        r_get = req_lib.get(url_item, headers=headers, timeout=10)
+                        if r_get.status_code == 200:
+                            item_id = r_get.json().get("id")
+                            req_lib.delete(
+                                f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}",
+                                headers=headers, timeout=10
+                            )
+                            print(f"[SP] Arquivo antigo removido: {caminho_antigo}")
+                    except Exception as ex:
+                        print(f"[SP] Erro ao apagar antigo: {ex}")
+
+                db4 = get_db()
+                try:
+                    d = db4.query(models.DocumentoEtapa).filter_by(id=doc_novo_id).first()
+                    if d:
+                        if sp_url:
+                            d.sharepoint_url = sp_url
+                            d.sharepoint_erro = None
+                        else:
+                            d.sharepoint_erro = sp_erro or "Falha desconhecida no upload"
+                        db4.commit()
+                finally:
+                    db4.close()
+            except Exception as ex:
+                print(f"[SP] Erro substituição: {ex}")
+                try:
+                    db5 = get_db()
+                    try:
+                        d = db5.query(models.DocumentoEtapa).filter_by(id=doc_novo_id).first()
+                        if d:
+                            d.sharepoint_erro = str(ex)
+                            db5.commit()
+                    finally:
+                        db5.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_substituir_sp, daemon=True).start()
+
+        audit.log(request.username, "SUBSTITUICAO_DOC", entity="processo",
+                  entity_id=processo_id,
+                  detail=f"Doc '{doc_antigo.nome}' substituído por '{arquivo.filename}' — {motivo}")
+
+        return jsonify({"ok": True, "novoDoc": doc_to_dict(doc_novo)}), 201
+    finally:
+        db.close()
+
+
+# ── Download de documento ─────────────────────────────────────
+
+@bp.get("/<int:processo_id>/etapas/<int:etapa_id>/documentos/<int:doc_id>/download")
+@require_auth
+def download_doc(processo_id, etapa_id, doc_id):
+    db = get_db()
+    try:
+        doc = db.query(models.DocumentoEtapa).filter_by(id=doc_id).first()
+        if not doc or not doc.arquivo or not os.path.exists(doc.arquivo):
+            return jsonify({"message": "Arquivo não encontrado"}), 404
+        return send_file(doc.arquivo, as_attachment=True, download_name=doc.nome)
+    finally:
+        db.close()
+
+
+# ── Colaboradores Admitidos ───────────────────────────────────
+
+@bp.get("/colaboradores-admitidos")
+@require_auth
+def colaboradores_admitidos():
+    """
+    Lista colaboradores cujo processo de admissão foi CONCLUÍDO.
+    Inclui o tempo total desde a candidatura até a conclusão,
+    além do tempo em cada etapa.
+    """
+    import sqlalchemy
+    db = get_db()
+    try:
+        processos = (
+            db.query(models.ProcessoAdmissao)
+            .filter(models.ProcessoAdmissao.status == "CONCLUIDO")
+            .options(
+                joinedload(models.ProcessoAdmissao.candidatura)
+                    .joinedload(models.Candidatura.job),
+                selectinload(models.ProcessoAdmissao.etapas),
+            )
+            .order_by(models.ProcessoAdmissao.updated_at.desc())
+            .all()
+        )
+
+        items = []
+        for p in processos:
+            try:
+                c = p.candidatura
+                if not c:
+                    continue
+                j = getattr(c, "job", None)
+
+                # Data de início da contagem = quando o candidato foi APROVADO
+                # na Triagem (1ª etapa), e não a data de candidatura/abertura
+                # da vaga. Isso reflete "dias desde que foi aprovado
+                # inicialmente como candidato" até a conclusão do processo.
+                triagem = next((e for e in p.etapas if e.codigo == "TRIAGEM"), None)
+                dt_aprovacao_inicial = None
+                if triagem and triagem.status == "APROVADO":
+                    dt_aprovacao_inicial = triagem.concluido_em or triagem.iniciado_em
+                # Fallback (ex.: processos antigos sem Triagem registrada corretamente)
+                dt_candidatura = dt_aprovacao_inicial or getattr(c, "applied_at", None) or p.created_at
+                dt_admitido    = p.concluido_em or p.updated_at
+
+                # Tempo total em dias
+                if dt_candidatura and dt_admitido:
+                    delta = dt_admitido - dt_candidatura
+                    dias_total = max(0, delta.days)
+                else:
+                    dias_total = None
+
+                # Detalhamento por etapa
+                etapas_timeline = []
+                for e in p.etapas:
+                    dur_dias = None
+                    if e.iniciado_em and e.concluido_em:
+                        d = e.concluido_em - e.iniciado_em
+                        dur_dias = max(0, d.days)
+                    etapas_timeline.append({
+                        "nome":        e.nome,
+                        "departamento": e.departamento,
+                        "status":       e.status,
+                        "iniciadoEm":  e.iniciado_em.isoformat() if e.iniciado_em else None,
+                        "concluidoEm": e.concluido_em.isoformat() if e.concluido_em else None,
+                        "duracaoDias": dur_dias,
+                    })
+
+                # Progresso por departamento: quantos dias cada dept usou
+                dept_tempos = {}
+                for e in p.etapas:
+                    if e.iniciado_em and e.concluido_em:
+                        d = e.concluido_em - e.iniciado_em
+                        dep = e.departamento
+                        dept_tempos[dep] = dept_tempos.get(dep, 0) + max(0, d.days)
+
+                items.append({
+                    "processoId":      p.id,
+                    "candidaturaId":   c.id,
+                    "nome":            c.full_name or "",
+                    "cpf":             c.cpf or "",
+                    "email":           c.email or "",
+                    "telefone":        c.phone or "",
+                    "cargo":           j.position if j else "",
+                    "local":           j.location if j else "",
+                    "dtCandidatura":   dt_candidatura.isoformat() if dt_candidatura else None,
+                    "dtAdmitido":      dt_admitido.isoformat() if dt_admitido else None,
+                    "diasTotal":       dias_total,
+                    "sharepointUrl":   p.sharepoint_url or "",
+                    "etapasTimeline":  etapas_timeline,
+                    "deptTempos":      dept_tempos,
+                })
+            except Exception as ex:
+                print(f"[ADMITIDOS] Erro ao processar processo {p.id}: {ex}")
+                continue
+
+        return jsonify(items)
+    finally:
+        db.close()
+
+
+# ── Banco de Talentos (candidatos cancelados) ─────────────────
+
+@bp.get("/banco-talentos")
+@require_auth
+def banco_talentos():
+    """Lista candidatos cancelados com dados para banco de talentos."""
+    db = get_db()
+    try:
+        processos = (
+            db.query(models.ProcessoAdmissao)
+            .filter(models.ProcessoAdmissao.status == "CANCELADO")
+            .options(
+                joinedload(models.ProcessoAdmissao.candidatura)
+                    .joinedload(models.Candidatura.job),
+            )
+            .order_by(models.ProcessoAdmissao.updated_at.desc())
+            .all()
+        )
+
+        items = []
+        for p in processos:
+            try:
+                c = p.candidatura
+                if not c:
+                    continue
+                j = getattr(c, 'job', None)
+                items.append({
+                    "processoId":    p.id,
+                    "candidaturaId": c.id,
+                    "nome":          getattr(c, 'full_name', '') or '',
+                    "email":         getattr(c, 'email', '') or '',
+                    "telefone":      getattr(c, 'phone', '') or '',
+                    "vaga":          j.position if j else '',
+                    "local":         j.location if j else '',
+                    "formacao":      getattr(c, 'education', '') or '',
+                    "experiencia":   getattr(c, 'experience', '') or '',
+                    "nrs":           getattr(c, 'nrs', '') or '',
+                    "cnh":           getattr(c, 'carteira_motorista', '') or '',
+                    "motivoCancelamento": p.etapa_atual or '',
+                    "dataCancelamento": p.updated_at.strftime("%d/%m/%Y") if p.updated_at else '',
+                    "curriculo":     bool(getattr(c, 'resume_name', None)),
+                    "downloadCurriculoUrl": f"/api/candidaturas/{c.id}/resume" if getattr(c, 'resume_name', None) else None,
+                    "notas":         getattr(p, "notas_internas", None) or '',
+                })
+            except Exception as ex:
+                print(f"[BANCO] Erro ao processar processo {p.id}: {ex}")
+                continue
+
+        return jsonify(items)
+    finally:
+        db.close()
+
+
+# ── Diagnóstico SharePoint ─────────────────────────────────────
+
+@bp.get("/sharepoint-test")
+@require_auth
+def sharepoint_test():
+    try:
+        from sharepoint_service import _get_token, _get_site_id, _get_drive_id, BASE_PATH
+        import requests as req_lib
+        token    = _get_token()
+        site_id  = _get_site_id()
+        drive_id = _get_drive_id(site_id)
+        headers  = {"Authorization": f"Bearer {token}"}
+        url      = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{BASE_PATH}"
+        r        = req_lib.get(url, headers=headers, timeout=10)
+        return jsonify({
+            "token": "OK", "site_id": site_id[:20],
+            "drive_id": drive_id[:20] if drive_id else None,
+            "base_path_status": r.status_code, "base_path": BASE_PATH,
+        })
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
