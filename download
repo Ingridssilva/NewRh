@@ -1,0 +1,23 @@
+# Ambiente
+.env
+*.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Node (se usado em alguma etapa do build do frontend)
+node_modules/
+
+# Editores / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
